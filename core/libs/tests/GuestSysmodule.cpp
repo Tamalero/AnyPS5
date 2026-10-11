@@ -1,6 +1,7 @@
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 
 extern "C" {
 int APS5_VABI sceSysmoduleIsLoaded(std::uint16_t id);
@@ -16,6 +17,8 @@ void Require(bool value) { if (!value) std::abort(); }
 
 constexpr std::uint16_t kFiberModuleId = 0x0006;
 constexpr std::uint16_t kUltModuleId = 0x0007;
+constexpr std::uint16_t kAcmModuleId = 0x010B;
+constexpr std::uint16_t kShareModuleId = 0x010F;
 constexpr int kModuleUnloaded = static_cast<int>(0x805A1001);
 
 }
@@ -37,4 +40,12 @@ int main() {
     Require(sceSysmoduleIsLoaded(kUltModuleId) == 0);
     Require(sceSysmoduleUnloadModule(kUltModuleId) == 0);
     Require(sceSysmoduleIsLoaded(kUltModuleId) == kModuleUnloaded);
+
+    for (const std::uint16_t id : {kAcmModuleId, kShareModuleId}) {
+        Require(sceSysmoduleIsLoaded(id) == kModuleUnloaded);
+        Require(sceSysmoduleLoadModule(id) == 0);
+        Require(sceSysmoduleIsLoaded(id) == 0);
+        Require(sceSysmoduleUnloadModule(id) == 0);
+        Require(sceSysmoduleIsLoaded(id) == kModuleUnloaded);
+    }
 }
