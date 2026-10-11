@@ -561,8 +561,14 @@ void RegisteredVertexWorkgroup(const ShaderRecompiler::SpirvTarget& target, bool
         header.specials.vgt_shader_stages_en.value = 0;
         ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "missing AGC user-data header");
         header.shader.user_data = &header.userData;
-        if (target.subgroupSize < 64u && std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr) {
-            ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "v_readlane_b32 of lane 63 is outside");
+        if (std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr) {
+            alignas(256) static constexpr std::array<std::uint32_t, 4> unpreparable{0xd8340000u, 0u, 0xbf8a0000u, 0xbf810000u};
+            const auto unpreparableAddress = reinterpret_cast<std::uintptr_t>(unpreparable.data());
+            header.shader.code = unpreparable.data();
+            header.shader.shader_size = sizeof(unpreparable);
+            header.registers[0].value = static_cast<std::uint32_t>(unpreparableAddress >> 8u);
+            header.registers[1].value = static_cast<std::uint32_t>(unpreparableAddress >> 40u);
+            ExpectFailure([&] { AgcDriverRegisterShader_nid_postfix(&header.shader); }, "s_barrier in a vertex program");
         }
         std::cout << "registered NGG preparation deferral passed; subgroup=" << target.subgroupSize << '\n';
         return;
