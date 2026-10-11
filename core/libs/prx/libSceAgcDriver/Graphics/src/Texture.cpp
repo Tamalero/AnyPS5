@@ -2943,6 +2943,12 @@ bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes
     return PublishShadow(address, bytes, scope, PublishReasonFor(reason)) != 0;
 }
 
+bool StorageTexture::AnyPending() {
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    return pending.textures.begin() != pending.textures.end();
+}
+
 void StorageTexture::FlushAllPending(const char* reason) {
     static_cast<void>(FlushPending(0, std::numeric_limits<std::size_t>::max(), nullptr, reason));
 }
