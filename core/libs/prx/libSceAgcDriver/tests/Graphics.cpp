@@ -1153,6 +1153,25 @@ void DepthBoundsBiasTests() {
 
 alignas(256) std::array<std::uint8_t, 4> dccKeys{};
 
+void unexportedPixelInputTests() {
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.interpolatorCount = 5;
+    pixel.interpolatorSettings[0] = 0x0;
+    pixel.interpolatorSettings[1] = 0x401;
+    pixel.interpolatorSettings[2] = 0x320;
+    pixel.interpolatorSettings[3] = 0x80003;
+    pixel.interpolatorSettings[4] = 0x4;
+    const std::array<std::uint32_t, 1> exports{1};
+    const auto fed = AgcDriver::Graphics::DefaultUnexportedPixelInputs(pixel, exports);
+    Require(fed.interpolatorSettings[0] == 0x20u, "an unexported parameter was not read as a default zero");
+    Require(fed.interpolatorSettings[1] == 0x401u, "an exported parameter changed");
+    Require(fed.interpolatorSettings[2] == 0x320u, "a default input changed");
+    Require(fed.interpolatorSettings[3] == 0x80003u, "a 16-bit input changed");
+    Require(fed.interpolatorSettings[4] == 0x20u, "an unexported parameter was not read as a default zero");
+    const std::array<std::uint32_t, 3> all{0, 1, 4};
+    Require(AgcDriver::Graphics::DefaultUnexportedPixelInputs(pixel, all).interpolatorSettings == pixel.interpolatorSettings, "fully exported inputs changed");
+}
+
 void metadataPassTests() {
     using AgcDriver::Graphics::ColorMetadataPass;
     using AgcDriver::Graphics::DecodeColorMetadataPass;
@@ -4067,6 +4086,7 @@ int main() {
         ReversedComponentOrderTests();
         DualSourceBlendTests();
         metadataPassTests();
+        unexportedPixelInputTests();
         cmaskTests();
         uint16ExportTests();
         uint8x4TargetTests();

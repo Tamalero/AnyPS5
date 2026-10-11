@@ -162,6 +162,18 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     };
 }
 
+ShaderRecompiler::ShaderPixelStageInfo DefaultUnexportedPixelInputs(const ShaderRecompiler::ShaderPixelStageInfo& pixel, std::span<const std::uint32_t> exports) {
+    auto result = pixel;
+    const auto count = std::min<std::uint32_t>(pixel.interpolatorCount, static_cast<std::uint32_t>(pixel.interpolatorSettings.size()));
+    for (std::uint32_t input = 0; input < count; ++input) {
+        const auto setting = pixel.interpolatorSettings[input];
+        if ((setting & 0x420u) == 0x20u || (setting & 0x80000u) != 0u) continue;
+        if (std::find(exports.begin(), exports.end(), setting & 0x1fu) != exports.end()) continue;
+        result.interpolatorSettings[input] = 0x20u;
+    }
+    return result;
+}
+
 ShaderRecompiler::ShaderVertexStageInfo DecodeVertexStageInfo(std::span<const std::byte> header, std::uint64_t headerAddress, std::span<const std::uint32_t> userData, std::vector<DecodeRead>* reads, bool staticAbi) {
     if (header.empty()) return {};
     if (header.size() < sizeof(Shader)) throw std::runtime_error("AGC graphics: shader header is smaller than the fixed AGC header");

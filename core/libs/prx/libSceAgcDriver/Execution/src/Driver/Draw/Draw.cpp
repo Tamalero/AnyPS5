@@ -4,7 +4,10 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <optional>
 
 namespace AgcDriver::DriverDetail {
 
@@ -204,7 +207,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             resultIndex[i] = results.size();
-            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+            std::optional<ShaderRecompiler::ShaderPixelStageInfo> fedPixel;
+            if (roles[i] == Role::Fragment && i == 1 && programs.size() == 2 && !graphics.rectList && graphics.stages.path == Graphics::ShaderPath::Vertex && programResults[0] != nullptr) {
+                fedPixel = Graphics::DefaultUnexportedPixelInputs(pixel, programResults[0]->parameterExports);
+                if (fedPixel->interpolatorSettings != pixel.interpolatorSettings) {
+                    static std::atomic<bool> reported{false};
+                    if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] pixel inputs whose parameter the vertex shader never exports read zero, as from an unwritten parameter cache entry\n");
+                }
+            }
+            results.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, fedPixel ? *fedPixel : pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[i] = &results.back();
         }
