@@ -351,8 +351,6 @@ namespace {
 // remembered, one byte of access flags per 4 KiB page (the table is committed lazily, so only the
 // pages ever verified cost memory). libc reports every range whose mapping or protection changed
 // (registry mutations and guest heap decommits) through the invalidator, which forgets those pages.
-// Only committed pages are cached; reserved pages are queried each time, so a commit made outside the
-// registry (the guest heap grows that way) is seen at once.
 // A second table covers the main guest image (the PE at 0x7ff6b...): its protections change only
 // through registry mutations (mprotect replaces the registered range and invalidates through the same
 // callback), and address-based builds verify every image section on each build, so without the table
@@ -435,14 +433,26 @@ struct PageStates {
         image.forget(address, bytes);
     }
 
-    void record(std::uintptr_t base, std::uintptr_t regionEnd, bool readable, bool writable, std::uint64_t generation) {
+    std::atomic<std::uint64_t> accessSerial{0};
+
+    void record(std::uintptr_t base, std::uintptr_t regionEnd, bool readable, bool writable, std::uint64_t generation, std::uint64_t access) {
         for (PageSpan* span : {&arena, &image}) {
             if (span->size == 0 || regionEnd <= span->base || base >= span->base + span->size) continue;
             const std::uint8_t value = readable ? static_cast<std::uint8_t>(PageReadable | (writable ? PageWritable : 0u)) : PageInaccessible;
             const auto first = std::max(base, span->base);
             const auto last = std::min(regionEnd, span->base + span->size);
             for (auto at = first; at < last; at += PageBytes) span->store(at, value);
-            if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation) span->forget(first, static_cast<std::size_t>(last - first));
+            if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != generation || accessSerial.load(std::memory_order_acquire) != access) span->forget(first, static_cast<std::size_t>(last - first));
+        }
+    }
+
+    void forgetInaccessible(std::uintptr_t address, std::size_t bytes) {
+        for (PageSpan* span : {&arena, &image}) {
+            if (span->size == 0 || bytes == 0 || address >= span->base + span->size || address + bytes <= span->base) continue;
+            const auto last = std::min(address + bytes, span->base + span->size);
+            for (auto at = std::max(address, span->base) & ~static_cast<std::uintptr_t>(PageBytes - 1); at < last; at += PageBytes) {
+                if (span->load(at) == PageInaccessible) span->store(at, 0);
+            }
         }
     }
 };
@@ -476,6 +486,11 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     forgetSerial.fetch_add(1, std::memory_order_release);
 }
 
+void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
+    Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
+    Pages().forgetInaccessible(address, bytes);
+}
+
 void PageStates::initialize() {
     std::call_once(once, [&] {
         GuestArena::GuestArenaRange_nid_postfix(&arena.base, &arena.size);
@@ -498,7 +513,10 @@ void PageStates::initialize() {
             imageCached = image.allocate();
         }
 #endif
-        if (arenaCached || imageCached) GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
+        if (arenaCached || imageCached) {
+            GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
+            GuestArena::GuestArenaSetAccessObserver_nid_postfix(&ForgetInaccessiblePages);
+        }
     });
 }
 
@@ -536,6 +554,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         // before it invalidates, so a generation change across the query and the store below means
         // the stored pages may describe the old state and are forgotten again.
         const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto access = pages.accessSerial.load(std::memory_order_acquire);
         if (cursor > userAddressLimit()) {
             static_cast<void>(emit(PageRun{cursor, end, false, false}));
             return true;
@@ -559,15 +578,16 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
         const bool committed = memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
         const bool readable = committed && readableProtection(protection);
         const bool writable = readable && writableProtection(protection);
-        if ((memory.Protect & PAGE_GUARD) == 0) pages.record(base, regionEnd, readable, writable, generation);
+        if ((memory.Protect & PAGE_GUARD) == 0) pages.record(base, regionEnd, readable, writable, generation, access);
         const auto next = std::min(end, regionEnd);
         if (!emit(PageRun{cursor, next, readable, writable})) return true;
         cursor = next;
 #else
         const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto access = pages.accessSerial.load(std::memory_order_acquire);
         const auto recordRun = [&](std::uintptr_t next, bool readable, bool writable) {
             constexpr auto mask = static_cast<std::uintptr_t>(PageBytes - 1);
-            pages.record(cursor & ~mask, (next + mask) & ~mask, readable, writable, generation);
+            pages.record(cursor & ~mask, (next + mask) & ~mask, readable, writable, generation, access);
         };
         if (const int fd = HostMapping::QueryFd(); fd >= 0) {
             procmap_query query{};
