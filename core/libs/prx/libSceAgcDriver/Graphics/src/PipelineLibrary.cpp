@@ -4,14 +4,18 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <thread>
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -66,8 +70,14 @@ std::atomic<unsigned> runningWorkers{0};
 
 std::size_t WorkerLimit() {
     static const std::size_t limit = [] {
+        const std::size_t hardware = std::max<std::size_t>(1, std::thread::hardware_concurrency());
         const char* text = std::getenv("APS5_PIPELINE_LTO_THREADS");
-        return text != nullptr ? std::max<std::size_t>(1, std::strtoul(text, nullptr, 10)) : std::max<std::size_t>(2, std::thread::hardware_concurrency() / 2);
+        if (text == nullptr) return std::max<std::size_t>(2, hardware / 2);
+        const char* end = text + std::strlen(text);
+        std::size_t value = 0;
+        const auto [last, error] = std::from_chars(text, end, value);
+        if (error != std::errc{} || last != end || value == 0 || value > hardware) throw std::runtime_error("APS5_PIPELINE_LTO_THREADS must be a whole number from 1 through " + std::to_string(hardware) + ", the hardware thread count");
+        return value;
     }();
     return limit;
 }

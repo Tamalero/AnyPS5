@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <functional>
 #include <mutex>
+#include <stdexcept>
+#include <string_view>
 #include <utility>
 
 using namespace AgcDriver::Graphics;
@@ -31,8 +33,21 @@ void Schedule(VkDevice device, std::function<void()> work) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     const auto device = reinterpret_cast<VkDevice>(std::uintptr_t{1});
+    if (argc == 2 && std::string_view(argv[1]) == "invalid") {
+        bool rejected = false;
+        try {
+            Schedule(device, [] {});
+        } catch (const std::runtime_error& error) {
+            rejected = std::string_view(error.what()).find("APS5_PIPELINE_LTO_THREADS") != std::string_view::npos;
+        }
+        Check(rejected, "an invalid worker count was accepted");
+        Check(PipelineLibraryWorkers() == 0, "a worker started for an invalid worker count");
+        std::printf("invalid worker count rejected before any worker started\n");
+        return 0;
+    }
+    Check(argc == 1, "expected no argument or invalid");
     std::mutex mutex;
     std::condition_variable changed;
     bool entered = false;
