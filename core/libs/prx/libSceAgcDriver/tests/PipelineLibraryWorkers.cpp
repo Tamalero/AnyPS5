@@ -47,12 +47,40 @@ int main(int argc, char** argv) {
         std::printf("invalid worker count rejected before any worker started\n");
         return 0;
     }
-    Check(argc == 1, "expected no argument or invalid");
     std::mutex mutex;
     std::condition_variable changed;
     bool entered = false;
     bool released = false;
     std::atomic<unsigned> completed{0};
+    if (argc == 2 && std::string_view(argv[1]) == "burst") {
+        Schedule(device, [&] { ++completed; });
+        WaitForOptimizedPipelines(device);
+        Check(completed == 1 && PipelineLibraryWorkers() == 1, "the first job did not run on one worker");
+        Schedule(device, [&] {
+            std::unique_lock lock(mutex);
+            changed.wait(lock, [&] { return released; });
+            ++completed;
+        });
+        Schedule(device, [&] {
+            std::lock_guard lock(mutex);
+            ++completed;
+            changed.notify_all();
+        });
+        {
+            std::unique_lock lock(mutex);
+            Check(changed.wait_for(lock, 3s, [&] { return completed == 2; }), "a burst queued behind the idle worker it woke with a second worker allowed");
+            released = true;
+        }
+        changed.notify_all();
+        WaitForOptimizedPipelines(device);
+        Check(completed == 3 && PipelineLibraryWorkers() == 2, "the burst did not run once each on two workers");
+        StopPipelineLibraryWorker();
+        ClearPipelineLibraries(device);
+        Check(PipelineLibraryWorkers() == 0, "the pipeline workers did not stop");
+        std::printf("two jobs queued at once behind one idle worker ran on two workers\n");
+        return 0;
+    }
+    Check(argc == 1, "expected no argument, invalid or burst");
     Schedule(device, [&] {
         std::unique_lock lock(mutex);
         entered = true;

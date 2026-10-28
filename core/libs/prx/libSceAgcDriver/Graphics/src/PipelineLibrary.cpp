@@ -106,7 +106,7 @@ void runJobs(LibraryStore& store) {
 
 void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
     if (store.stopping) return;
-    if (store.waitingWorkers == 0 && store.workers.size() < WorkerLimit()) {
+    if (store.waitingWorkers <= store.jobs.size() && store.workers.size() < WorkerLimit()) {
         store.workers.emplace_back(runJobs, std::ref(store));
         runningWorkers.fetch_add(1, std::memory_order_acq_rel);
     }
