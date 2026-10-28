@@ -1,0 +1,78 @@
+#include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
+#include <utility>
+
+using namespace AgcDriver::Graphics;
+using namespace std::chrono_literals;
+
+namespace {
+
+void Check(bool condition, const char* message) {
+    if (condition) return;
+    std::fprintf(stderr, "FAIL: %s\n", message);
+    std::fflush(stderr);
+    std::_Exit(1);
+}
+
+void Schedule(VkDevice device, std::function<void()> work) {
+    OptimizedPipeline pipeline;
+    pipeline.device = device;
+    pipeline.relink = std::move(work);
+    pipeline.deferred = true;
+    pipeline.Schedule();
+}
+
+}
+
+int main() {
+    const auto device = reinterpret_cast<VkDevice>(std::uintptr_t{1});
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false;
+    bool released = false;
+    std::atomic<unsigned> completed{0};
+    Schedule(device, [&] {
+        std::unique_lock lock(mutex);
+        entered = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return released; });
+        ++completed;
+    });
+    {
+        std::unique_lock lock(mutex);
+        Check(changed.wait_for(lock, 3s, [&] { return entered; }), "the first worker did not start");
+    }
+
+    Schedule(device, [&] {
+        ++completed;
+        changed.notify_all();
+    });
+    {
+        std::unique_lock lock(mutex);
+        Check(changed.wait_for(lock, 3s, [&] { return completed == 1; }), "a job waited behind a held job with a second worker allowed");
+    }
+    Check(PipelineLibraryWorkers() == 2, "the queue did not start a second worker");
+
+    Schedule(device, [&] { ++completed; });
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+    }
+    changed.notify_all();
+    WaitForOptimizedPipelines(device);
+    Check(completed == 3, "a job was lost or ran twice");
+    Check(PipelineLibraryWorkers() == 2, "the queue started more workers than allowed");
+
+    StopPipelineLibraryWorker();
+    ClearPipelineLibraries(device);
+    Check(PipelineLibraryWorkers() == 0, "the pipeline workers did not stop");
+    std::printf("two workers: a job finished while another was held, three jobs ran once each, both workers stopped\n");
+    return 0;
+}
