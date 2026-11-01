@@ -118,6 +118,7 @@ void SpirvModule::BeginHelperFunction() {
     if (inHelperFunction) throw std::runtime_error("SpirvModule helper functions cannot nest");
     std::swap(functionInstructions, helperFunctionInstructions);
     std::swap(ballots, helperBallots);
+    std::swap(openLoopMerges, helperOpenLoopMerges);
     inHelperFunction = true;
 }
 
@@ -125,6 +126,7 @@ void SpirvModule::EndHelperFunction() {
     if (!inHelperFunction) throw std::runtime_error("SpirvModule::EndHelperFunction without a helper function");
     std::swap(functionInstructions, helperFunctionInstructions);
     std::swap(ballots, helperBallots);
+    std::swap(openLoopMerges, helperOpenLoopMerges);
     inHelperFunction = false;
 }
 

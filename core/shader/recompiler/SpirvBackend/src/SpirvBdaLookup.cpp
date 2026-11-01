@@ -5,6 +5,8 @@
 #include <utility>
 #include <iterator>
 #include <initializer_list>
+#include <cstdlib>
+#include <string_view>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -41,9 +43,19 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpBranch, outerBody);
     EmitLabel(state, outerBody);
     std::vector<std::uint32_t> exits{spv::OpPhi, resultType, state.module.AllocateId()};
-    const auto leave = [&](std::uint32_t value) {
+    // APS5_SPIRV_FAULT_ONCE=1 (prototype for #13538): failures leave with their reason, and the merge records one fault,
+    // so the inlined lookup holds one record_bda_fault instead of one per check.
+    static const bool faultOnce = [] {
+        const char* value = std::getenv("APS5_SPIRV_FAULT_ONCE");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    const bool recordOnce = recordFaults && faultOnce;
+    std::vector<std::uint32_t> reasons{spv::OpPhi, u32, state.module.AllocateId()};
+    const auto leave = [&](std::uint32_t value, std::uint32_t reason = 0u) {
         exits.push_back(value);
         exits.push_back(state.currentLabel);
+        reasons.push_back(reason == 0u ? constant(0u) : reason);
+        reasons.push_back(state.currentLabel);
         state.module.AddFunction(spv::OpBranch, outerMerge);
     };
     const auto leaveIf = [&](std::uint32_t condition, std::uint32_t reason) {
@@ -52,8 +64,8 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
         state.module.AddFunction(spv::OpBranchConditional, condition, failed, next);
         EmitLabel(state, failed);
-        if (recordFaults) RecordBdaFaultReason(state, address, bytes, instruction, reason);
-        leave(zero);
+        if (recordFaults && !recordOnce) RecordBdaFaultReason(state, address, bytes, instruction, reason);
+        leave(zero, recordOnce ? reason : 0u);
         EmitLabel(state, next);
     };
     const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) { leaveIf(condition, recordFaults ? constant(static_cast<std::uint32_t>(reason)) : 0u); };
@@ -139,6 +151,12 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpBranch, outer);
     EmitLabel(state, outerMerge);
     state.module.AddFunction(exits);
+    if (recordOnce) {
+        state.module.AddFunction(reasons);
+        EmitIfCondition(state, binary(spv::OpINotEqual, boolean, reasons[2], constant(0u)), [&] {
+            RecordBdaFaultReason(state, address, bytes, instruction, reasons[2]);
+        });
+    }
     state.module.AddFunction(spv::OpReturnValue, exits[2]);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;

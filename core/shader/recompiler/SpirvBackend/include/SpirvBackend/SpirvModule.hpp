@@ -137,7 +137,14 @@ public:
 
     template<typename... TOperands>
     void AddFunction(std::uint32_t opcode, const TOperands&... operands) {
+        if constexpr (sizeof...(TOperands) != 0) trackOpenLoops(opcode, operands...);
         appendInstruction(functionInstructions, opcode, operands...);
+    }
+
+    // The merge label of the innermost loop whose OpLoopMerge was emitted in the current function and whose merge
+    // label was not yet emitted; 0 outside loops.
+    [[nodiscard]] std::uint32_t InnermostOpenLoopMerge() const {
+        return openLoopMerges.empty() ? 0u : openLoopMerges.back();
     }
 
 private:
@@ -271,6 +278,17 @@ private:
     BlockBallots ballots;
     BlockBallots helperBallots;
     bool inHelperFunction = false;
+    std::vector<std::uint32_t> openLoopMerges;
+    std::vector<std::uint32_t> helperOpenLoopMerges;
+
+    template<typename TFirst, typename... TRest>
+    void trackOpenLoops(std::uint32_t opcode, const TFirst& first, const TRest&...) {
+        if constexpr (std::is_convertible_v<TFirst, std::uint32_t>) {
+            const auto id = static_cast<std::uint32_t>(first);
+            if (opcode == spv::OpLoopMerge) openLoopMerges.push_back(id);
+            else if (opcode == spv::OpLabel && !openLoopMerges.empty() && openLoopMerges.back() == id) openLoopMerges.pop_back();
+        }
+    }
 };
 
 }

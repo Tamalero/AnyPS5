@@ -108,6 +108,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         state.module.AddFunction(spv::OpLoad, TypeU32(state), expected, pointer);
         EmitKillIfBoolFalse(state, Binary(state, spv::OpIEqual, TypeBool(state), masked, expected));
     }
+    FlushPendingBdaFault(state);
     EmitReturnReleasingScratch(state);
 }
 
@@ -718,6 +719,88 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
     }
 }
 
+// APS5_SPIRV_STOP_EXIT=1: see SpirvEmitterState::stopExit.
+bool StopExitEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_SPIRV_STOP_EXIT");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+// Where each block's stops branch: the merge of its innermost guest loop, or `exit` outside loops. A loop's merge
+// re-checks the stop flag and branches on to its own target, so a loop whose merge is itself a loop header (the
+// re-check cannot be split off) or whose merge has no target gets 0 for its blocks, which keeps their OpReturn.
+// `outer` receives, for every merge that may re-check, the label its re-check branches to.
+std::unordered_map<const IrBlock*, std::uint32_t> StopTargets(SpirvValueEmitContext& ctx, const IrProgram& program, std::uint32_t exit,
+                                                              std::unordered_map<std::uint32_t, std::uint32_t>& outer) {
+    const std::vector<IrBlock*>& blocks = program.BlockOrder();
+    struct Loop {
+        const IrBlock* merge = nullptr;
+        std::unordered_set<const IrBlock*> body;
+    };
+    std::vector<Loop> loops;
+    std::unordered_set<const IrBlock*> headers;
+    for (const IrBlock* header : blocks) {
+        const BlockInfo* info = BlockInfoFor(program, header);
+        if (info == nullptr || !info->terminator.loopHeader || info->terminator.mergeBlock == InvalidControlFlowId) continue;
+        const IrBlock* merge = TargetBlock(program, info->terminator.mergeBlock);
+        if (merge == nullptr) continue;
+        headers.insert(header);
+        Loop loop{merge, {header}};
+        std::vector<const IrBlock*> pending{header};
+        while (!pending.empty()) {
+            const IrBlock* current = pending.back();
+            pending.pop_back();
+            const BlockInfo* currentInfo = BlockInfoFor(program, current);
+            if (currentInfo == nullptr) continue;
+            const Terminator& term = currentInfo->terminator;
+            std::vector<std::uint32_t> ids;
+            if (term.kind == TerminatorKind::Branch || term.kind == TerminatorKind::ConditionalBranch) ids.push_back(term.trueBlock);
+            if (term.kind == TerminatorKind::ConditionalBranch) ids.push_back(term.falseBlock);
+            for (const auto id : ids) {
+                if (id == InvalidControlFlowId) continue;
+                const IrBlock* next = TargetBlock(program, id);
+                if (next == nullptr || next == merge || next == header || !loop.body.insert(next).second) continue;
+                pending.push_back(next);
+            }
+        }
+        loops.push_back(std::move(loop));
+    }
+    std::unordered_map<const IrBlock*, std::uint32_t> targets;
+    const auto resolve = [&](const auto& self, const IrBlock* block) -> std::uint32_t {
+        if (const auto found = targets.find(block); found != targets.end()) return found->second;
+        const Loop* innermost = nullptr;
+        for (const Loop& loop : loops) {
+            if (loop.body.contains(block) && (innermost == nullptr || loop.body.size() < innermost->body.size())) innermost = &loop;
+        }
+        std::uint32_t target = exit;
+        if (innermost != nullptr) {
+            const std::uint32_t onward = headers.contains(innermost->merge) ? 0u : self(self, innermost->merge);
+            target = onward == 0u ? 0u : ctx.Label(innermost->merge);
+            if (target != 0u) outer[target] = onward;
+        }
+        targets.emplace(block, target);
+        return target;
+    };
+    for (const IrBlock* block : blocks) resolve(resolve, block);
+    return targets;
+}
+
+// At a merge that stops branch to: after its Phis, a stopped invocation branches on towards the exit.
+void EmitStopRecheck(SpirvEmitterState& state) {
+    const auto edges = state.stopEdges.find(state.currentLabel);
+    if (edges == state.stopEdges.end() || edges->second.empty()) return;
+    const auto onward = state.stopOuterTarget.at(state.currentLabel);
+    const auto stopped = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeBool(state), stopped, state.stopFlag);
+    const auto next = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, stopped, onward, next);
+    state.stopEdges[onward].push_back(state.currentLabel);
+    EmitLabel(state, next);
+}
+
 void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrValue& inst) {
     if (inst.Opcode() == IrOpcode::Phi) {
         const auto type = TypeId(ctx.state, inst.Type());
@@ -730,7 +813,15 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
                 ctx.Fail(inst, "has a predecessor outside the structured function");
             }
         }
-        functionState.deferredPhis.push_back({ctx.state.module.AddDeferredPhi(type, ctx.Result(inst), inst.ArgumentCount()), &inst, ctx.half});
+        // Stop branches into this block (see SpirvEmitterState::stopExit) are extra predecessors; their value is never
+        // used, because the block re-checks the stop flag right after its Phis.
+        const auto edges = ctx.state.stopEdges.find(ctx.state.currentLabel);
+        const std::size_t extra = edges == ctx.state.stopEdges.end() ? 0u : edges->second.size();
+        const auto phi = ctx.state.module.AddDeferredPhi(type, ctx.Result(inst), inst.ArgumentCount() + extra);
+        for (std::size_t index = 0; index < extra; index++) {
+            ctx.state.module.PatchDeferredPhi(phi, inst.ArgumentCount() + index, ctx.state.module.Constant(spv::OpUndef, type), edges->second[index]);
+        }
+        functionState.deferredPhis.push_back({phi, &inst, ctx.half});
         return;
     }
     EmitDirectInstruction(ctx, inst);
@@ -751,6 +842,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 ctx.Fail(*inst, "appears after a non-Phi instruction");
             }
         } else {
+            if (!emittedNonPhi) EmitStopRecheck(state);
             emittedNonPhi = true;
         }
         if (state.waveLdsScope != 0) {
@@ -790,6 +882,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
         }
         state.laneHalf = 0;
     }
+    if (!emittedNonPhi) EmitStopRecheck(state);
 }
 
 void PatchStructuredPhis(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState) {
@@ -851,6 +944,25 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         state.module.AddFunction(spv::OpStore, state.loopGuardVisits, ConstantU32(state, 0u));
         state.module.AddFunction(spv::OpStore, state.loopGuardPc, ConstantU32(state, 0u));
     }
+    ResetPendingBdaFault(state);
+    // APS5_SPIRV_STOP_EXIT=1: the body runs inside a loop that runs once; stops branch to its merge (see stopExit).
+    const bool stopExit = StopExitEnabled() && state.program.Resources().stage != IrShaderStage::Pixel && state.bdaStopValue == 0;
+    std::unordered_map<const IrBlock*, std::uint32_t> stopTargets;
+    std::uint32_t stopHeader = 0;
+    std::uint32_t stopContinue = 0;
+    if (stopExit) {
+        state.stopEdges.clear();
+        state.stopOuterTarget.clear();
+        state.stopExit = state.module.AllocateId();
+        stopHeader = state.module.AllocateId();
+        stopContinue = state.module.AllocateId();
+        state.stopFlag = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeBool(state)), spv::StorageClassPrivate);
+        state.module.AddFunction(spv::OpStore, state.stopFlag, ConstantBool(state, false));
+        stopTargets = StopTargets(context, program, state.stopExit, state.stopOuterTarget);
+        state.module.AddFunction(spv::OpBranch, stopHeader);
+        EmitLabel(state, stopHeader);
+        state.module.AddFunction(spv::OpLoopMerge, state.stopExit, stopContinue, spv::LoopControlMaskNone);
+    }
     state.module.AddFunction(spv::OpBranch, context.Label(blocks.front()));
     static const bool debug = std::getenv("APS5_SRT_DEBUG") != nullptr;
     if (debug) {
@@ -874,11 +986,20 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         const bool stops = state.bdaStopsInvocations;
         state.continueTarget = IsContinueTarget(program, info->id);
         state.bdaStopsInvocations = stops && !state.continueTarget;
+        state.stopTarget = stopExit ? stopTargets.at(block) : 0u;
         EmitStructuredBlock(context, functionState, block);
         functionState.blockExitLabels.emplace(block, state.currentLabel);
         EmitStructuredTerminator(context, program, *info);
+        state.stopTarget = 0u;
         state.bdaStopsInvocations = stops;
         state.continueTarget = false;
+    }
+    if (stopExit) {
+        EmitLabel(state, stopContinue);
+        state.module.AddFunction(spv::OpBranch, stopHeader);
+        EmitLabel(state, state.stopExit);
+        FlushPendingBdaFault(state);
+        EmitReturnReleasingScratch(state);
     }
     PatchStructuredPhis(context, functionState);
 }

@@ -25,6 +25,10 @@ void ValidateBdaTarget(const IrProgram& program, const SpirvTargetOptions& targe
 // every invocation running, so their faulting reads return zero instead.
 bool BdaInvocationsMayStop(const IrProgram& program);
 void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition);
+// APS5_SPIRV_FAULT_DEFER=1 (see SpirvEmitterState::pendingFaultReason): zero the pending fault at the start of main,
+// and write it to the fault buffer before an invocation leaves. Both do nothing when deferral is off.
+void ResetPendingBdaFault(SpirvEmitterState& state);
+void FlushPendingBdaFault(SpirvEmitterState& state);
 std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst);
 std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bits);
 std::uint32_t EmitBdaReadBytes(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bytes);

@@ -3,7 +3,9 @@
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <stdexcept>
+#include <string_view>
 
 namespace ShaderRecompiler {
 
@@ -53,9 +55,22 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
     const auto scope = ConstantU32(state, spv::ScopeDevice);
     const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
     const auto notUnaligned = Binary(state, spv::OpINotEqual, TypeBool(state), reason, ConstantU32(state, static_cast<std::uint32_t>(BdaAbi::FaultReason::Unaligned)));
-    EmitIfCondition(state, notUnaligned, [&] {
-        state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, ConstantU32(state, static_cast<std::uint32_t>(offsetof(BdaAbi::Fault, otherFaults) / sizeof(std::uint32_t)))), scope, relaxed, ConstantU32(state, 1u));
-    });
+    const auto otherFaults = ConstantU32(state, static_cast<std::uint32_t>(offsetof(BdaAbi::Fault, otherFaults) / sizeof(std::uint32_t)));
+    // APS5_SPIRV_FAULT_FLAT=1 (prototype for #13538): OR 0 or 1 unconditionally instead of branching; this function is
+    // inlined tens of thousands of times into large shaders, and each branch is a nested if for RADV.
+    static const bool flat = [] {
+        const char* value = std::getenv("APS5_SPIRV_FAULT_FLAT");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    if (flat) {
+        const auto bit = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelect, u32, bit, notUnaligned, ConstantU32(state, 1u), ConstantU32(state, 0u));
+        state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, otherFaults), scope, relaxed, bit);
+    } else {
+        EmitIfCondition(state, notUnaligned, [&] {
+            state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, otherFaults), scope, relaxed, ConstantU32(state, 1u));
+        });
+    }
     state.module.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), previous, pointer, scope, relaxed, relaxed, ConstantU32(state, static_cast<std::uint32_t>(BdaAbi::FaultState::Writing)), ConstantU32(state, 0u));
     const auto won = Binary(state, spv::OpIEqual, TypeBool(state), previous, ConstantU32(state, 0u));
     EmitIfCondition(state, won, [&] {
@@ -73,19 +88,108 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
     });
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
+    // APS5_SPIRV_FAULT_DEFER=1: the lookups defined after this record into the pending fault instead of calling here.
+    static const bool defer = [] {
+        const char* value = std::getenv("APS5_SPIRV_FAULT_DEFER");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    if (defer && state.program.Resources().stage != IrShaderStage::Pixel) {
+        const auto pointerType = TypePointer(state, spv::StorageClassPrivate, u32);
+        state.pendingFaultReason = state.module.DefineGlobalVariable(pointerType, spv::StorageClassPrivate);
+        state.pendingFaultLow = state.module.DefineGlobalVariable(pointerType, spv::StorageClassPrivate);
+        state.pendingFaultHigh = state.module.DefineGlobalVariable(pointerType, spv::StorageClassPrivate);
+        state.pendingFaultBytes = state.module.DefineGlobalVariable(pointerType, spv::StorageClassPrivate);
+        state.pendingFaultInstruction = state.module.DefineGlobalVariable(pointerType, spv::StorageClassPrivate);
+        state.pendingFaultOther = state.module.DefineGlobalVariable(pointerType, spv::StorageClassPrivate);
+    }
+}
+
+namespace {
+
+// Keeps the first fault of the invocation (a branch-free update) and notes any fault that is not Unaligned.
+void DeferBdaFault(SpirvEmitterState& state, std::uint32_t reason, std::uint32_t low, std::uint32_t high, std::uint32_t bytes, std::uint32_t instruction) {
+    const auto u32 = TypeU32(state);
+    const auto load = [&](std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, variable);
+        return value;
+    };
+    const auto current = load(state.pendingFaultReason);
+    const auto first = Binary(state, spv::OpIEqual, TypeBool(state), current, ConstantU32(state, 0u));
+    const auto keep = [&](std::uint32_t variable, std::uint32_t value, std::uint32_t old) {
+        const auto chosen = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelect, u32, chosen, first, value, old);
+        state.module.AddFunction(spv::OpStore, variable, chosen);
+    };
+    keep(state.pendingFaultReason, reason, current);
+    keep(state.pendingFaultLow, low, load(state.pendingFaultLow));
+    keep(state.pendingFaultHigh, high, load(state.pendingFaultHigh));
+    keep(state.pendingFaultBytes, bytes, load(state.pendingFaultBytes));
+    keep(state.pendingFaultInstruction, instruction, load(state.pendingFaultInstruction));
+    const auto notUnaligned = Binary(state, spv::OpINotEqual, TypeBool(state), reason, ConstantU32(state, static_cast<std::uint32_t>(BdaAbi::FaultReason::Unaligned)));
+    const auto bit = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelect, u32, bit, notUnaligned, ConstantU32(state, 1u), ConstantU32(state, 0u));
+    state.module.AddFunction(spv::OpStore, state.pendingFaultOther, Binary(state, spv::OpBitwiseOr, u32, load(state.pendingFaultOther), bit));
+}
+
+void DeferBdaFault64(SpirvEmitterState& state, std::uint32_t reason, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
+    const auto u32 = TypeU32(state);
+    const auto low = Unary(state, spv::OpUConvert, u32, address);
+    const auto high = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), address, BdaConstant(state, 32u)));
+    DeferBdaFault(state, reason, low, high, bytes, instruction);
+}
+
+}
+
+void ResetPendingBdaFault(SpirvEmitterState& state) {
+    if (state.pendingFaultReason == 0) return;
+    for (const auto variable : {state.pendingFaultReason, state.pendingFaultLow, state.pendingFaultHigh, state.pendingFaultBytes, state.pendingFaultInstruction, state.pendingFaultOther}) {
+        state.module.AddFunction(spv::OpStore, variable, ConstantU32(state, 0u));
+    }
+}
+
+void FlushPendingBdaFault(SpirvEmitterState& state) {
+    if (state.pendingFaultReason == 0) return;
+    const auto u32 = TypeU32(state);
+    const auto load = [&](std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, variable);
+        return value;
+    };
+    const auto reason = load(state.pendingFaultReason);
+    EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), reason, ConstantU32(state, 0u)), [&] {
+        const auto low = load(state.pendingFaultLow);
+        const auto high = load(state.pendingFaultHigh);
+        const auto bytes = load(state.pendingFaultBytes);
+        const auto instruction = load(state.pendingFaultInstruction);
+        if (state.program.Info().usesDma) {
+            const auto u64 = TypeScalarU64(state);
+            const auto address = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, low), Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, high), BdaConstant(state, 32u)));
+            state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, reason, address, bytes, instruction);
+        } else {
+            state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, reason, low, high, bytes, instruction);
+        }
+    });
+    // record_bda_fault marks otherFaults for the first fault; a later fault that was not Unaligned marks it here.
+    EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), load(state.pendingFaultOther), ConstantU32(state, 0u)), [&] {
+        state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, ConstantU32(state, static_cast<std::uint32_t>(offsetof(BdaAbi::Fault, otherFaults) / sizeof(std::uint32_t)))), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 1u));
+    });
 }
 
 void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason) {
     if (state.bdaFaultFunction == 0 || !state.program.Info().usesDma) throw std::runtime_error("BDA fault function is missing");
+    if (state.pendingFaultReason != 0) return DeferBdaFault64(state, ConstantU32(state, static_cast<std::uint32_t>(reason)), address, bytes, instruction);
     state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, ConstantU32(state, static_cast<std::uint32_t>(reason)), address, bytes, instruction);
 }
 
 void RecordBdaFaultReason(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t reason) {
     if (state.bdaFaultFunction == 0 || !state.program.Info().usesDma) throw std::runtime_error("BDA fault function is missing");
+    if (state.pendingFaultReason != 0) return DeferBdaFault64(state, reason, address, bytes, instruction);
     state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, reason, address, bytes, instruction);
 }
 
 void RecordBdaFaultWords(SpirvEmitterState& state, std::uint32_t addressLow, std::uint32_t addressHigh, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason) {
+    if (state.pendingFaultReason != 0) return DeferBdaFault(state, ConstantU32(state, static_cast<std::uint32_t>(reason)), addressLow, addressHigh, bytes, instruction);
     if (state.program.Info().usesDma) {
         const auto u64 = TypeScalarU64(state);
         const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, addressHigh), BdaConstant(state, 32u));
@@ -116,11 +220,18 @@ void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
     EmitLabel(state, failed);
     if (state.bdaStopValue != 0) {
         state.module.AddFunction(spv::OpReturnValue, state.bdaStopValue);
+    } else if (state.stopTarget != 0 && state.module.InnermostOpenLoopMerge() == state.stopTarget) {
+        // A stop inside a loop the emitter built within one instruction keeps its OpReturn: a branch to stopTarget
+        // would leave that loop without a structured exit.
+        if (state.stopTarget != state.stopExit) state.module.AddFunction(spv::OpStore, state.stopFlag, ConstantBool(state, true));
+        state.stopEdges[state.stopTarget].push_back(state.currentLabel);
+        state.module.AddFunction(spv::OpBranch, state.stopTarget);
     } else {
         if (OrderedPixelShader(state)) {
             state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
         }
         if (state.program.Resources().stage != IrShaderStage::Pixel) {
+            FlushPendingBdaFault(state);
             EmitReturnReleasingScratch(state);
         } else if (state.pixelStopFlag != 0u) {
             state.module.AddFunction(spv::OpStore, state.pixelStopFlag, ConstantBool(state, true));

@@ -200,6 +200,26 @@ struct SpirvEmitterState {
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
     bool continueTarget = false;
+    // APS5_SPIRV_STOP_EXIT=1 (prototype for #13538): a stopped compute invocation leaves through one structured exit
+    // instead of an OpReturn per BDA check, which RADV's nir_lower_returns would nest everything after behind.
+    // stopExit is the merge of a loop around the whole body; stopTarget is where the current block's stops branch
+    // (the innermost guest loop's merge, or stopExit; 0 keeps the OpReturn); stopEdges lists the stop branches into
+    // each merge, whose Phis take OpUndef for them and which re-check stopFlag after its Phis, branching to
+    // stopOuterTarget.
+    std::uint32_t stopExit = 0;
+    std::uint32_t stopFlag = 0;
+    std::uint32_t stopTarget = 0;
+    std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> stopEdges;
+    std::unordered_map<std::uint32_t, std::uint32_t> stopOuterTarget;
+    // APS5_SPIRV_FAULT_DEFER=1 (prototype for #13538): Private u32 variables holding the invocation's first BDA fault
+    // (reason, address low and high words, bytes, instruction) and whether any fault was not Unaligned. Fault checks
+    // only update them; FlushPendingBdaFault writes the fault buffer once per invocation exit. 0 = disabled.
+    std::uint32_t pendingFaultReason = 0;
+    std::uint32_t pendingFaultLow = 0;
+    std::uint32_t pendingFaultHigh = 0;
+    std::uint32_t pendingFaultBytes = 0;
+    std::uint32_t pendingFaultInstruction = 0;
+    std::uint32_t pendingFaultOther = 0;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
     // host invocations (see WaveLdsScope); 0 when none are emitted.
     std::uint32_t waveLdsScope = 0;
