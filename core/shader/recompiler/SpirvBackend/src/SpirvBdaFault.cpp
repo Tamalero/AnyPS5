@@ -31,6 +31,15 @@ std::uint32_t BdaLoadAddress(SpirvEmitterState& state, std::uint32_t index) {
     return Binary(state, spv::OpBitwiseOr, TypeScalarU64(state), low, Binary(state, spv::OpShiftLeftLogical, TypeScalarU64(state), high, BdaConstant(state, 32u)));
 }
 
+// APS5_SPIRV_FAULT_DEFER: 1 = keep the first fault; cost tests only: 2 = record nothing, 3 = keep only the reason.
+int DeferMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("APS5_SPIRV_FAULT_DEFER");
+        return value == nullptr ? 0 : std::atoi(value);
+    }();
+    return mode;
+}
+
 void DefineBdaFaultFunction(SpirvEmitterState& state) {
     const auto u32 = TypeU32(state);
     const bool words = !state.program.Info().usesDma;
@@ -89,10 +98,7 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpReturn);
     state.module.AddFunction(spv::OpFunctionEnd);
     // APS5_SPIRV_FAULT_DEFER=1: the lookups defined after this record into the pending fault instead of calling here.
-    static const bool defer = [] {
-        const char* value = std::getenv("APS5_SPIRV_FAULT_DEFER");
-        return value != nullptr && std::string_view(value) == "1";
-    }();
+    const bool defer = DeferMode() != 0;
     if (defer && state.program.Resources().stage != IrShaderStage::Pixel) {
         const auto pointerType = TypePointer(state, spv::StorageClassPrivate, u32);
         state.pendingFaultReason = state.module.DefineGlobalVariable(pointerType, spv::StorageClassPrivate);
@@ -114,6 +120,7 @@ void DeferBdaFault(SpirvEmitterState& state, std::uint32_t reason, std::uint32_t
         state.module.AddFunction(spv::OpLoad, u32, value, variable);
         return value;
     };
+    if (DeferMode() == 2) return;
     const auto current = load(state.pendingFaultReason);
     const auto first = Binary(state, spv::OpIEqual, TypeBool(state), current, ConstantU32(state, 0u));
     const auto keep = [&](std::uint32_t variable, std::uint32_t value, std::uint32_t old) {
@@ -122,6 +129,7 @@ void DeferBdaFault(SpirvEmitterState& state, std::uint32_t reason, std::uint32_t
         state.module.AddFunction(spv::OpStore, variable, chosen);
     };
     keep(state.pendingFaultReason, reason, current);
+    if (DeferMode() == 3) return;
     keep(state.pendingFaultLow, low, load(state.pendingFaultLow));
     keep(state.pendingFaultHigh, high, load(state.pendingFaultHigh));
     keep(state.pendingFaultBytes, bytes, load(state.pendingFaultBytes));
