@@ -12,6 +12,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <string_view>
 #include <stdexcept>
 #include <string>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
@@ -329,7 +330,13 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.waveLdsScope = WaveLdsScope(program, workgroup, state.laneCount);
     if (const char* guard = std::getenv("APS5_LOOP_GUARD")) state.loopGuardLimit = static_cast<std::uint32_t>(std::strtoul(guard, nullptr, 0));
     // Stopped invocations would leave the wave LDS barriers incomplete.
-    state.bdaStopsInvocations = state.waveLdsScope == 0 && !state.spannedWave && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
+    // APS5_SPIRV_BDA_CONTINUE=1 (prototype for #13538): every compute program takes the continue-on-fault path that programs
+    // with barriers already use (unmapped reads give zero, writes are skipped, the fault is recorded) instead of OpReturn.
+    static const bool bdaContinue = [] {
+        const char* value = std::getenv("APS5_SPIRV_BDA_CONTINUE");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    state.bdaStopsInvocations = !(bdaContinue && program.Resources().stage == IrShaderStage::Compute) && state.waveLdsScope == 0 && !state.spannedWave && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     state.meshWindowBuffer = target.meshWindowBuffer && program.Resources().stage == IrShaderStage::Mesh && program.Metadata().vectorWindowSize != 0u && state.laneCount * MeshWindowInvocations(state) * program.Metadata().vectorWindowSize <= MeshWindowSlotDwords;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
